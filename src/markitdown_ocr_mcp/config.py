@@ -9,9 +9,6 @@ import json
 import os
 from pathlib import Path
 
-# Fallback when no env override and /v1/models discovery fails.
-DEFAULT_OMLX_MODEL = "PaddleOCR-VL-1.6-MLX-8bit"
-
 
 def _omlx_api_key() -> str:
     """API key from env, else from oMLX's own settings file, else its default."""
@@ -35,8 +32,15 @@ class Settings:
     omlx_api_key: str = _omlx_api_key()
     # Empty string -> discover from GET /v1/models at first use.
     omlx_model: str = os.getenv("OMLX_OCR_MODEL", "")
-    # PaddleOCR-VL expects its task prompt, not the plugin's generic one.
+    # GLM-OCR works well with a plain task prompt; the plugin's generic
+    # description prompt is not what an OCR model expects.
     omlx_prompt: str = os.getenv("OMLX_OCR_PROMPT", "OCR:")
+    # Direct-OCR rendering: DPI for normal pages, and the hard pixel cap on
+    # the long side that keeps oMLX's prefill within its memory guard
+    # (1750px needs ~28 GB of prefill; 1300px stays well inside the guard
+    # even when other models/apps are loaded, with no measurable quality loss).
+    ocr_dpi: int = int(os.getenv("OCR_DPI", "150"))
+    ocr_max_long_side: int = int(os.getenv("OCR_MAX_LONG_SIDE", "1300"))
 
 
 settings = Settings()

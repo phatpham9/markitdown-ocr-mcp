@@ -4,22 +4,18 @@ import pytest
 from fake_llm import FakeVisionClient
 from markitdown import MarkItDown
 
-from markitdown_ocr_mcp.convert import (
-    OcrConverter,
-    _extract_page_range,
-    _parse_page_spec,
-)
+from markitdown_ocr_mcp.convert import OcrConverter, _parse_page_spec
 
 
 def make_converter(client: FakeVisionClient) -> OcrConverter:
     """Build an OcrConverter with an injected fake vision backend.
 
     Skips __init__ (which contacts oMLX for model discovery) and wires the
-    markitdown instance directly — the production path `get_converter()`
-    does exactly this construction with a real OpenAI client.
+    client + markitdown instance directly — the production path
+    `get_converter()` does exactly this construction with a real OpenAI client.
     """
     converter = object.__new__(OcrConverter)
-    converter.client = None
+    converter.client = client
     converter.model = "fake-vision-model"
     converter.markitdown = MarkItDown(
         enable_plugins=True,
@@ -35,7 +31,7 @@ def test_scanned_pdf_is_ocrd(pdf_path) -> None:
     text = make_converter(client).convert_pdf(str(pdf_path("scanned")))
 
     assert "QUARTERLY REVENUE GREW" in text
-    assert len(client.calls) >= 1
+    assert len(client.calls) == 1
     call = client.calls[0]
     assert call["model"] == "fake-vision-model"
     content = call["messages"][0]["content"]
@@ -48,15 +44,33 @@ def test_digital_pdf_needs_no_ocr(pdf_path) -> None:
 
     assert "Quarterly Report Summary" in text
     assert client.calls == []
+    assert "<!-- Page 1 -->" in text and "<!-- Page 2 -->" in text
 
 
-def test_mixed_pdf_ocrs_image_and_keeps_text(pdf_path) -> None:
+def test_mixed_pdf_is_ocrd_full_page(pdf_path) -> None:
     client = FakeVisionClient(reply="IMAGE CAPTION TEXT")
     text = make_converter(client).convert_pdf(str(pdf_path("mixed")))
 
-    assert "Quarterly Report Summary" in text  # text layer preserved
-    assert "IMAGE CAPTION TEXT" in text  # embedded image OCR'd
-    assert len(client.calls) >= 1
+    # Mixed pages go through full-page OCR (not the text layer), so only the
+    # OCR reply appears.
+    assert "IMAGE CAPTION TEXT" in text
+    assert len(client.calls) == 1
+
+
+def test_blank_pdf_produces_marker_without_ocr(pdf_path) -> None:
+    client = FakeVisionClient()
+    text = make_converter(client).convert_pdf(str(pdf_path("blank")))
+
+    assert "<!-- Page 1 -->" in text
+    assert client.calls == []
+
+
+def test_empty_ocr_reply_is_not_fatal(pdf_path) -> None:
+    client = FakeVisionClient(reply="")
+    text = make_converter(client).convert_pdf(str(pdf_path("scanned")))
+
+    assert "<!-- Page 1 -->" in text
+    assert len(client.calls) == 1
 
 
 def test_page_subset_limits_ocr(pdf_path) -> None:
@@ -68,11 +82,12 @@ def test_page_subset_limits_ocr(pdf_path) -> None:
 
 
 def test_out_path_writes_file_and_returns_summary(pdf_path, tmp_path) -> None:
-    out = tmp_path / "result.md"
+    out = tmp_path / "nested" / "result.md"
     client = FakeVisionClient()
     summary = make_converter(client).convert_pdf(str(pdf_path("scanned")), out_path=str(out))
 
     assert "Wrote" in summary and "fake-vision-model" in summary
+    assert "'source': 'ocr'" in summary
     assert "FAKE_OCR_TEXT" in out.read_text()
 
 
@@ -99,12 +114,3 @@ class TestParsePageSpec:
     def test_invalid(self, spec) -> None:
         with pytest.raises(ValueError):
             _parse_page_spec(spec, page_count=10)
-
-
-def test_extract_page_range_makes_sub_pdf(pdf_path) -> None:
-    sub = _extract_page_range(pdf_path("digital"), "1,2")
-    try:
-        result = make_converter(FakeVisionClient()).convert_pdf(str(sub))
-        assert "Quarterly Report Summary" in result
-    finally:
-        sub.unlink(missing_ok=True)

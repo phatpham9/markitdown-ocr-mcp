@@ -1,5 +1,13 @@
-"""OCR-enabled PDF conversion: MarkItDown + markitdown-ocr plugin + oMLX."""
+"""OCR-enabled PDF conversion: hybrid MarkItDown + direct oMLX OCR.
 
+Per page: pages with a real text layer go through MarkItDown (exact text);
+scanned/mixed pages are rendered and OCR'd directly by the vision model at a
+pixel-capped DPI. The markitdown-ocr plugin's own scanned-page path is not
+used — its hardcoded 300 DPI rendering blows oMLX's prefill memory guard on
+this machine, and the plugin swallows the resulting errors silently.
+"""
+
+import base64
 import os
 import re
 import tempfile
@@ -10,6 +18,7 @@ from markitdown import MarkItDown
 from openai import OpenAI
 
 from .config import settings
+from .inspect import classify_page
 
 
 class OmlxUnavailableError(RuntimeError):
@@ -27,8 +36,8 @@ def _new_client() -> OpenAI:
 def resolve_model(client: OpenAI) -> str:
     """Pick the OCR model id: env override, else discover from /v1/models.
 
-    Prefers PaddleOCR-VL, then GLM-OCR, then the first listed model.
-    Falls back to the default id if discovery fails.
+    Prefers GLM-OCR (small prefill footprint that fits oMLX's memory guard
+    on this machine), then the first listed model, then the default id.
     """
     if settings.omlx_model:
         return settings.omlx_model
@@ -40,7 +49,7 @@ def resolve_model(client: OpenAI) -> str:
             f"Cannot reach oMLX at {settings.omlx_url} — is it running? (`omlx start`)"
         ) from exc
 
-    for prefix in ("PaddleOCR", "GLM-OCR"):
+    for prefix in ("GLM-OCR",):
         match = next((mid for mid in ids if prefix.lower() in mid.lower()), None)
         if match:
             return match
@@ -67,23 +76,109 @@ class OcrConverter:
         path: str,
         pages: str | None = None,
         out_path: str | None = None,
+        dpi: int | None = None,
     ) -> str:
+        """Convert a PDF to Markdown, OCR-ing scanned/image pages.
+
+        Pages are classified without OCR first; see module docstring for the
+        per-kind strategy. `pages` ("1-5,9") limits conversion to a subset.
+        """
         pdf_path = _validate_pdf_path(path)
-        source = _extract_page_range(pdf_path, pages) if pages else pdf_path
-        try:
-            result = self.markitdown.convert(str(source))
-        finally:
-            if source != pdf_path:
-                source.unlink(missing_ok=True)
-        text = result.text_content
+        dpi = dpi or settings.ocr_dpi
+
+        with pymupdf.open(pdf_path) as doc:
+            if doc.needs_pass:
+                raise ValueError(f"PDF is password-protected: {pdf_path}")
+            count = doc.page_count
+            indexes = _parse_page_spec(pages, count) if pages else list(range(count))
+
+            # Page objects are only valid while the document is open, so the
+            # whole per-page loop lives inside the context manager.
+            parts: list[str] = []
+            stats: list[dict] = []
+            for index in indexes:
+                number = index + 1
+                page = doc[index]
+                info = classify_page(page)
+                if info["kind"] == "blank":
+                    text, source = "", "blank"
+                elif info["kind"] == "text":
+                    text = self._convert_text_page(pdf_path, index)
+                    source = "markitdown"
+                else:  # scanned / mixed
+                    text = self._ocr_page_direct(page, number, dpi)
+                    source = "ocr"
+                parts.append(f"<!-- Page {number} -->\n\n{text.strip()}")
+                stats.append(
+                    {"page": number, "source": source, "chars": len(text), "kind": info["kind"]}
+                )
+
+        markdown = "\n\n".join(parts) + "\n"
 
         if out_path:
             out = Path(out_path)
-            out.write_text(text, encoding="utf-8")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(markdown, encoding="utf-8")
             return (
-                f"Conversion complete. Model: {self.model}. Wrote {len(text)} characters to {out}"
+                f"Conversion complete. Model: {self.model}. "
+                f"Wrote {len(markdown)} characters to {out}. "
+                f"Per-page sources: {stats}"
             )
-        return text
+        return markdown
+
+    def _convert_text_page(self, pdf_path: Path, index: int) -> str:
+        """Extract one text-layer page via MarkItDown (1-page sub-PDF)."""
+        with pymupdf.open(pdf_path) as sub:
+            sub.select([index])
+            fd, tmp_name = tempfile.mkstemp(suffix=".pdf", prefix="ocr-page-")
+            os.close(fd)
+            try:
+                sub.save(tmp_name)
+            except Exception:
+                Path(tmp_name).unlink(missing_ok=True)
+                raise
+        try:
+            return self.markitdown.convert(tmp_name).text_content
+        finally:
+            Path(tmp_name).unlink(missing_ok=True)
+
+    def _ocr_page_direct(self, page: pymupdf.Page, number: int, dpi: int) -> str:
+        """Render one page and OCR it with the vision model directly.
+
+        The effective DPI is clamped so the long side stays within
+        settings.ocr_max_long_side pixels — beyond that, oMLX's memory guard
+        rejects the vision prefill.
+        """
+        effective_dpi = int(
+            min(
+                dpi,
+                settings.ocr_max_long_side * 72.0 / max(page.rect.width, page.rect.height),
+            )
+        )
+        pix = page.get_pixmap(dpi=effective_dpi)
+        png = pix.tobytes("png")
+        data_uri = f"data:image/png;base64,{base64.b64encode(png).decode()}"
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                        {"type": "text", "text": settings.omlx_prompt},
+                    ],
+                }
+            ],
+            temperature=0,
+            max_tokens=8192,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            # The model reports nothing on this page (blank / photo-only).
+            # Not fatal — surfaced as chars=0 in the per-page stats.
+            return ""
+        return content
 
 
 _converter: OcrConverter | None = None
@@ -116,29 +211,6 @@ def _validate_pdf_path(path: str) -> Path:
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {path}")
     return pdf_path
-
-
-def _extract_page_range(pdf_path: Path, spec: str) -> Path:
-    """Build a sub-PDF containing the requested 1-based pages.
-
-    `spec` is a comma-separated list of single pages and ranges, e.g. "1-5,9".
-    """
-    with pymupdf.open(pdf_path) as doc:
-        if doc.needs_pass:
-            raise ValueError(f"PDF is password-protected: {pdf_path}")
-        count = doc.page_count
-        zero_based = _parse_page_spec(spec, count)
-        # select() mutates in place — fine, this document is a throwaway copy.
-        doc.select(zero_based)
-
-        fd, tmp_name = tempfile.mkstemp(suffix=".pdf", prefix="ocr-pages-")
-        os.close(fd)
-        try:
-            doc.save(tmp_name)
-        except Exception:
-            Path(tmp_name).unlink(missing_ok=True)
-            raise
-    return Path(tmp_name)
 
 
 def _parse_page_spec(spec: str, page_count: int) -> list[int]:

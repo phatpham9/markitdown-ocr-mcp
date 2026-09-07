@@ -1,6 +1,6 @@
 # markitdown-ocr-mcp — Implementation Plan
 
-A thin MCP server exposing **MarkItDown + markitdown-ocr (LLM-vision) + oMLX/PaddleOCR-VL** to Claude Code. Local, hybrid PDF → Markdown with page-level inspection, no custom OCR pipeline.
+A thin MCP server exposing **MarkItDown + markitdown-ocr (LLM-vision) + oMLX/GLM-OCR** to Claude Code. Local, hybrid PDF → Markdown with page-level inspection, no custom OCR pipeline.
 
 ## 1. Goal
 
@@ -12,12 +12,12 @@ Claude Code ──MCP──▶ markitdown-ocr-mcp ──▶ MarkItDown (+ markit
                                   OpenAI-compatible client
                                                   │
                                                   ▼
-                                        oMLX :8000 (PaddleOCR-VL-1.6-MLX-8bit)
+                                        oMLX :8080 (GLM-OCR-4bit)
 ```
 
 **Success criteria**
 1. `inspect_pdf` classifies pages (text/scanned/mixed/blank) without OCR.
-2. `ocr_pdf` converts scanned + mixed PDFs to Markdown, OCR via oMLX-served PaddleOCR-VL.
+2. `ocr_pdf` converts scanned + mixed PDFs to Markdown, OCR via oMLX-served GLM-OCR.
 3. Registered globally in Claude Code; `claude mcp list` shows it; stdio probe works.
 4. Unit tests green without oMLX (fake client); live smoke test green with oMLX.
 
@@ -26,14 +26,14 @@ Claude Code ──MCP──▶ markitdown-ocr-mcp ──▶ MarkItDown (+ markit
 - **markitdown-ocr** (official plugin, PyPI 0.1.0) already implements the hybrid pipeline we had planned to build: automatic scanned-page detection (renders at 300 DPI, full page to LLM), inline OCR of embedded images interleaved in reading order, malformed-PDF recovery via PyMuPDF. It is LLM-vision — any OpenAI-compatible client — *not* PaddleOCR-the-library.
 - Installed markitdown 0.1.7 supports the `markitdown.plugin` entry-point group and forwards `llm_client`/`llm_model`/`llm_prompt` kwargs to plugins (verified in installed source).
 - The CLI has no `--llm-*` flags, and the official **markitdown-mcp never injects an `llm_client`** (verified in source) — so the plugin silently no-ops there. A thin custom MCP server is the only way to get OCR into Claude Code.
-- oMLX 0.6.4 already has `OpenGryd/PaddleOCR-VL-1.6-MLX-8bit` downloaded; it serves it through an OpenAI-compatible API.
+- oMLX 0.6.4 serves `mlx-community/GLM-OCR-4bit` through an OpenAI-compatible API.
 
 ## 3. Environment
 
 | Component | State |
 |---|---|
 | oMLX | 0.6.4, loopback **:8080**, OpenAI-compatible (`/v1`), default API key `1234` |
-| OCR model | `PaddleOCR-VL-1.6-MLX-8bit` in `~/.omlx/models/OpenGryd/` |
+| OCR model | `GLM-OCR-4bit` in `~/.omlx/models/mlx-community/` |
 | markitdown / markitdown-ocr | 0.1.7 / 0.1.0 (both on PyPI) |
 | Python / uv | 3.14.7 / 0.12.9 |
 
@@ -45,25 +45,22 @@ Claude Code ──MCP──▶ markitdown-ocr-mcp ──▶ MarkItDown (+ markit
 |---|---|
 | `OMLX_URL` | `http://127.0.0.1:8080/v1` |
 | `OMLX_API_KEY` | env override; else auto-read from `~/.omlx/settings.json`; else oMLX's dev default |
-| `OMLX_OCR_MODEL` | empty → auto-discover from `/v1/models` (prefer id containing `PaddleOCR`); fallback `PaddleOCR-VL-1.6-MLX-8bit` |
-| `OMLX_OCR_PROMPT` | `OCR:` (PaddleOCR-VL task prompt — the plugin's generic default is not what this model expects) |
+| `OMLX_OCR_MODEL` | empty → auto-discover from `/v1/models` (prefer id containing `GLM-OCR`) |
+| `OMLX_OCR_PROMPT` | `OCR:` (task prompt — the plugin's generic default is not what an OCR model expects) |
+| `OCR_DPI` | `150` (direct-OCR render DPI) |
+| `OCR_MAX_LONG_SIDE` | `1750` (pixel cap keeping the vision prefill inside oMLX's memory guard) |
 
-### 4.2 Core convert path (`convert.py`)
+### 4.2 Core convert path (`convert.py`) — hybrid, implemented 2026-09-07
 
-```python
-md = MarkItDown(
-    enable_plugins=True,
-    llm_client=OpenAI(base_url=OMLX_URL, api_key=OMLX_API_KEY),
-    llm_model=resolved_model,
-    llm_prompt=OMLX_OCR_PROMPT,
-)
-return md.convert(path).text_content
-```
+Per page, after `inspect_pdf`-style classification:
 
-Notes:
-- Plugin behavior: scanned pages auto-rendered at 300 DPI → full-page LLM call; embedded images OCR'd inline; LLM errors swallowed per image (conversion continues).
-- `llm_prompt` is global — per-image table/formula prompts require patching the plugin (Plan B territory).
-- Model id resolved once per server lifetime via `/v1/models` and cached.
+- `text` pages → 1-page sub-PDF → MarkItDown (exact text-layer extraction, no vision calls)
+- `scanned`/`mixed` pages → render at `OCR_DPI` (long side clamped to `OCR_MAX_LONG_SIDE` px) → direct `chat/completions` call to the vision model with `OMLX_OCR_PROMPT`
+- `blank` pages → empty section
+
+Pages are merged in order with `<!-- Page N -->` markers; per-page source/char stats are reported.
+
+Why not the plugin's own scanned path: it hardcodes 300 DPI and swallows LLM errors. On this machine oMLX's memory guard rejects ~28 GB vision prefills for large pages, so 300 DPI scans fail silently. Direct OCR with a pixel-capped DPI (150 DPI / 1750 px long side, both env-tunable) fits the guard and measured 87.1% word recall vs. ground-truth text layers on real TOEIC scans.
 
 ### 4.3 Inspection (`inspect.py`, PyMuPDF, no OCR)
 
@@ -76,10 +73,11 @@ inspect_pdf(path: str) -> dict
     { pages, kinds: {text, scanned, mixed, blank},
       pages: [{ page (1-based), kind, text_chars, image_count, image_coverage }] }
 
-ocr_pdf(path: str, pages: str | None = None, out_path: str | None = None) -> str
-    Full markitdown-ocr conversion. `pages` ("1-5,9") extracts a page-range
-    sub-PDF via PyMuPDF first (targeted OCR without converting whole docs).
-    `out_path` writes result to file and returns a summary instead of the full text.
+ocr_pdf(path: str, pages: str | None = None, out_path: str | None = None,
+        dpi: int | None = None) -> str
+    Hybrid conversion (§4.2). `pages` ("1-5,9") limits to a page subset.
+    `out_path` writes result to file and returns a summary with per-page
+    sources. `dpi` overrides OCR_DPI.
 
 omlx_models() -> dict
     GET /v1/models passthrough + the resolved OCR model — for diagnosing
@@ -131,13 +129,27 @@ markitdown-ocr/
 
 | Risk | Mitigation |
 |---|---|
-| PaddleOCR-VL broken on oMLX 0.6.4 (history: 0.4.0 Metal regression) | Phase 4 gates; fallback: GLM-OCR or Qwen-VL via oMLX (just a model id + prompt change) |
+| GLM-OCR broken on an oMLX upgrade | fallback: Qwen-VL or any other vision model via oMLX (just a model id + prompt change) |
 | OCR model load disables Qwen MTP (#1758) | Test in Phase 4; document reload-Qwen workaround |
-| Generic prompt degrades PaddleOCR-VL | `OMLX_OCR_PROMPT=OCR:` default (plugin's llm_prompt) |
+| Generic prompt degrades OCR quality | `OMLX_OCR_PROMPT=OCR:` default (plugin's llm_prompt) |
 | LLM errors silently swallowed by plugin | `omlx_models` tool + stats in ocr_pdf summary for diagnosis |
 | markitdown 0.1.8 changes plugin kwargs | Deps pinned in pyproject (`markitdown>=0.1.7,<0.2`) |
 | Python 3.14 wheel gaps (pandas/pdfminer/pdfplumber) | `uv python pin 3.13` fallback |
 
-## 8. Plan B (fallback, only if plugin output quality disappoints)
+## 8. Plan B — triggered and implemented (2026-09-07)
 
-Full custom pipeline from the original plan: per-page PyMuPDF classification + per-page MarkItDown + direct oMLX calls with per-page prompts (`OCR:` / `Table Recognition:` / `Formula Recognition:`), page-range/DPI/stats control. The `inspect.py` module here is its first building block. Trigger: benchmark markitdown-ocr vs. direct per-page OCR on real PDFs (tables, formulas, multi-column); escalate where the plugin loses fidelity.
+The plugin path failed on real scanned PDFs (hardcoded 300 DPI → oMLX prefill
+memory-guard rejection → silently empty pages), so the hybrid direct-OCR path
+in §4.2 replaced it for scanned/mixed pages.
+
+On real TOEIC scans: Listening = 87.1% word recall vs. ground-truth text
+layers; Reading = 26/26 pages clean; Practice Test One (39 pages, 96-DPI
+oversized scans) = good quality. GLM-OCR-4bit's CogViT encoder has a small
+enough prefill footprint to fit oMLX's memory guard on this machine
+(PaddleOCR-VL-8bit needed ~36 GB per page and was dropped). oMLX's guard tier
+is set to `aggressive` in `~/.omlx/settings.json` (reversible).
+
+Remaining future work: per-page prompt selection (Table/Formula/Chart),
+PDF-image quality heuristics (upscaling/denoising for low-DPI scans),
+concurrency/batching, and kernel `iogpu.wired_limit_mb` if a higher-res model
+is ever needed.

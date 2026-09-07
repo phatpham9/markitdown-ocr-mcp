@@ -3,7 +3,7 @@
 MCP server exposing OCR-enabled PDF → Markdown conversion to Claude Code.
 
 MarkItDown + the official `markitdown-ocr` LLM-vision plugin, backed by a local
-oMLX server running PaddleOCR-VL (or any OpenAI-compatible vision endpoint).
+oMLX server running GLM-OCR (or any OpenAI-compatible vision endpoint).
 
 ## Setup
 
@@ -18,7 +18,7 @@ oMLX must be running (`omlx start`) with a vision model loaded.
 ## Tools
 
 - `inspect_pdf(path)` — per-page classification (text / scanned / mixed / blank), no OCR
-- `ocr_pdf(path, pages?, out_path?)` — full hybrid conversion to Markdown; `pages` ("1-5,9") extracts only a page subset; `out_path` writes to file
+- `ocr_pdf(path, pages?, out_path?, dpi?)` — hybrid conversion to Markdown: text-layer pages via MarkItDown (exact text), scanned/mixed pages rendered and OCR'd directly by the vision model; `pages` ("1-5,9") extracts only a page subset; `out_path` writes to file; `dpi` overrides OCR_DPI
 - `omlx_models()` — oMLX health check + available models + resolved OCR model
 
 ## Testing
@@ -35,5 +35,7 @@ uv run python scripts/probe_mcp.py   # end-to-end probe of the installed binary
 |---|---|
 | `OMLX_URL` | `http://127.0.0.1:8080/v1` |
 | `OMLX_API_KEY` | auto-read from `~/.omlx/settings.json` |
-| `OMLX_OCR_MODEL` | auto-discovered from `/v1/models` |
+| `OMLX_OCR_MODEL` | auto-discovered from `/v1/models` — prefers GLM-OCR (small prefill footprint) |
 | `OMLX_OCR_PROMPT` | `OCR:` |
+| `OCR_DPI` | `150` (render DPI for direct OCR) |
+| `OCR_MAX_LONG_SIDE` | `1300` (pixel cap keeping oMLX's prefill inside its memory guard) |

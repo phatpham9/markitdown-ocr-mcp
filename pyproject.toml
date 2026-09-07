@@ -1,7 +1,7 @@
 [project]
 name = "markitdown-ocr-mcp"
 version = "0.1.0"
-description = "Thin MCP wrapper exposing MarkItDown + markitdown-ocr (LLM vision) with oMLX/PaddleOCR-VL to Claude Code"
+description = "Thin MCP wrapper exposing MarkItDown + markitdown-ocr (LLM vision) with oMLX/GLM-OCR to Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

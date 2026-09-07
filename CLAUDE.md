@@ -1,7 +1,10 @@
 # markitdown-ocr-mcp
 
-Thin MCP server: MarkItDown + markitdown-ocr plugin, OCR via oMLX (PaddleOCR-VL).
+Thin MCP server: MarkItDown + markitdown-ocr plugin, OCR via oMLX (GLM-OCR).
 MCP tools: `inspect_pdf`, `ocr_pdf`, `omlx_models`.
+
+Hybrid conversion: text-layer pages go through MarkItDown; scanned/mixed pages
+are rendered (OCR_DPI, capped at OCR_MAX_LONG_SIDE px) and OCR'd directly.
 
 ## Local OCR guidance
 
